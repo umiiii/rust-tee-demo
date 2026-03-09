@@ -21,7 +21,7 @@ struct VsockListenerAdapter {
 
 #[cfg(feature = "vsock")]
 impl VsockListenerAdapter {
-    fn new(listener: VsockListener) -> Self {
+    fn new(mut listener: VsockListener) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
             loop {
