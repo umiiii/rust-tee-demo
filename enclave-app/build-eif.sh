@@ -5,12 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$SCRIPT_DIR"
 
-cargo build --release --features vsock
+TARGET=x86_64-unknown-linux-musl
+cargo build --release --features vsock --target "$TARGET"
 
 DOCKER_IMAGE=enclave:latest
 EIF_OUTPUT=enclave.eif
 
-cp target/release/enclave-app enclave
+cp "target/$TARGET/release/enclave-app" enclave
 
 docker build -t $DOCKER_IMAGE .
 
