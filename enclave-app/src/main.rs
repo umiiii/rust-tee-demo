@@ -1,4 +1,5 @@
-use axum::{extract::Request, response::IntoResponse, routing::post, Router};
+use axum::{extract::Request, http::StatusCode, response::IntoResponse, routing::{get, post}, Router};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
@@ -53,6 +54,58 @@ impl Listener for VsockListenerAdapter {
     }
 }
 
+#[cfg(feature = "vsock")]
+fn generate_attestation_doc(
+    user_data: &[u8],
+    nonce: &[u8],
+    pub_key: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use aws_nitro_enclaves_nsm_api::api::{Request as NsmRequest, Response};
+    use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+    use serde_bytes::ByteBuf;
+
+    let fd = nsm_init();
+    if fd < 0 {
+        return Err("failed to initialize NSM driver".into());
+    }
+
+    let request = NsmRequest::Attestation {
+        user_data: if user_data.is_empty() { None } else { Some(ByteBuf::from(user_data.to_vec())) },
+        nonce: if nonce.is_empty() { None } else { Some(ByteBuf::from(nonce.to_vec())) },
+        public_key: if pub_key.is_empty() { None } else { Some(ByteBuf::from(pub_key.to_vec())) },
+    };
+
+    let response = nsm_process_request(fd, request);
+    nsm_exit(fd);
+
+    match response {
+        Response::Attestation { document } => Ok(document.to_vec()),
+        Response::Error(err) => Err(format!("NSM error: {:?}", err).into()),
+        _ => Err("unexpected NSM response".into()),
+    }
+}
+
+#[cfg(not(feature = "vsock"))]
+fn generate_attestation_doc(
+    _user_data: &[u8],
+    _nonce: &[u8],
+    _pub_key: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Err("attestation is not supported without the vsock feature".into())
+}
+
+async fn handle_attestation() -> impl IntoResponse {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let secret_key = k256::SecretKey::random(&mut rand::rngs::OsRng);
+    let pub_key = secret_key.public_key().to_encoded_point(false); // uncompressed, 65 bytes
+
+    match generate_attestation_doc(b"Tradezone TEE Verifier", b"", pub_key.as_bytes()) {
+        Ok(doc) => (StatusCode::OK, B64.encode(&doc)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn handle_upload(req: Request) -> impl IntoResponse {
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
@@ -79,7 +132,9 @@ async fn handle_upload(req: Request) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new().route("/upload", post(handle_upload));
+    let app = Router::new()
+        .route("/upload", post(handle_upload))
+        .route("/attestation", get(handle_attestation));
 
     #[cfg(feature = "vsock")]
     {

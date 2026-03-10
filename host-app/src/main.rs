@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures::stream;
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::body::Frame;
 use hyper::client::conn::http1;
 use hyper::Request;
@@ -31,16 +31,17 @@ fn parse_size(s: &str) -> Result<usize, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: host-app <size> <cid>");
-        eprintln!("  size: 100KB | 500MB | 1GB");
+        eprintln!("Usage: host-app <cid> <cmd> [size]");
         eprintln!("  cid:  enclave CID (vsock feature only; ignored otherwise)");
+        eprintln!("  cmd:  upload | gen_doc");
+        eprintln!("  size: required for upload — 100KB | 500MB | 1GB");
         std::process::exit(1);
     }
 
-    let upload_size = parse_size(&args[1])?;
-
     #[cfg(feature = "vsock")]
-    let cid: u32 = args[2].parse().map_err(|_| format!("invalid CID '{}'", args[2]))?;
+    let cid: u32 = args[1].parse().map_err(|_| format!("invalid CID '{}'", args[1]))?;
+
+    let cmd = args[2].as_str();
 
     #[cfg(feature = "vsock")]
     let io = {
@@ -58,31 +59,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut sender, conn) = http1::handshake(io).await?;
     tokio::spawn(conn);
 
-    let num_chunks = upload_size.div_ceil(CHUNK_SIZE);
-    let chunk = Bytes::from(vec![0xABu8; CHUNK_SIZE]);
-    let body = StreamBody::new(stream::iter(
-        (0..num_chunks)
-            .map(move |_| Ok::<Frame<Bytes>, std::io::Error>(Frame::data(chunk.clone()))),
-    ));
-
-    eprintln!("[host] Uploading {} bytes ({} chunks)...", upload_size, num_chunks);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/upload")
-        .header("host", "enclave")
-        .header("content-type", "application/octet-stream")
-        .body(body)?;
-
     let start = std::time::Instant::now();
-    let res = sender.send_request(req).await?;
+
+    let res = match cmd {
+        "upload" => {
+            if args.len() < 4 {
+                eprintln!("upload requires a size argument");
+                std::process::exit(1);
+            }
+            let upload_size = parse_size(&args[3])?;
+            let num_chunks = upload_size.div_ceil(CHUNK_SIZE);
+            let chunk = Bytes::from(vec![0xABu8; CHUNK_SIZE]);
+            let body = StreamBody::new(stream::iter(
+                (0..num_chunks)
+                    .map(move |_| Ok::<Frame<Bytes>, std::io::Error>(Frame::data(chunk.clone()))),
+            ));
+            eprintln!("[host] Uploading {} bytes ({} chunks)...", upload_size, num_chunks);
+            let req = Request::builder()
+                .method("POST")
+                .uri("/upload")
+                .header("host", "enclave")
+                .header("content-type", "application/octet-stream")
+                .body(BoxBody::new(body))?;
+            sender.send_request(req).await?
+        }
+        "gen_doc" => {
+            eprintln!("[host] Requesting attestation doc...");
+            let req = Request::builder()
+                .method("GET")
+                .uri("/attestation")
+                .header("host", "enclave")
+                .body(BoxBody::new(Empty::<Bytes>::new().map_err(|_| unreachable!())))?;
+            sender.send_request(req).await?
+        }
+        other => {
+            eprintln!("unknown command '{}': expected upload or gen_doc", other);
+            std::process::exit(1);
+        }
+    };
+
     let status = res.status();
     let body_bytes = res.collect().await?.to_bytes();
     let elapsed = start.elapsed();
 
-    println!("Status: {}", status);
-    println!("Response: {}", String::from_utf8_lossy(&body_bytes));
-    println!("Duration: {:.3}s", elapsed.as_secs_f64());
+    if cmd == "gen_doc" {
+        if status.is_success() {
+            println!("{}", String::from_utf8_lossy(&body_bytes));
+        } else {
+            eprintln!("[host] attestation failed ({}): {}", status, String::from_utf8_lossy(&body_bytes));
+            std::process::exit(1);
+        }
+    } else {
+        println!("Status: {}", status);
+        println!("Response: {}", String::from_utf8_lossy(&body_bytes));
+        println!("Duration: {:.3}s", elapsed.as_secs_f64());
+    }
 
     Ok(())
 }
