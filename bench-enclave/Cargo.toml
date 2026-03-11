@@ -1,0 +1,14 @@
+[package]
+name = "bench-enclave"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = { version = "0.29", features = ["socket", "net"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

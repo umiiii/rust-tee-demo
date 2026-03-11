@@ -1,8 +1,12 @@
+use alloy_primitives::{keccak256, B256, U256};
+use base64::Engine;
+use k256::ecdsa::SigningKey;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 use nix::sys::socket::{
     accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
 };
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -10,18 +14,59 @@ use std::os::unix::net::UnixStream;
 const VSOCK_PORT: u32 = 5000;
 const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
 
+// --- Command / Response protocol ---
+
 #[derive(Debug, Deserialize)]
-struct Input {
-    values: Vec<i64>,
-    #[allow(dead_code)]
-    operation: String,
+#[serde(tag = "command")]
+enum Command {
+    #[serde(rename = "init")]
+    Init,
+
+    #[serde(rename = "sign-batch")]
+    SignBatch {
+        start_output_root: String, // hex bytes32
+        end_output_root: String,   // hex bytes32
+        l2_block_number: u64,
+        chain_id: u64,
+    },
+
+    #[serde(rename = "health")]
+    Health,
 }
 
 #[derive(Debug, Serialize)]
-struct Output {
-    result: i64,
-    processed: bool,
+#[serde(tag = "type")]
+enum Response {
+    #[serde(rename = "init")]
+    Init {
+        public_key: String,            // hex, 65 bytes uncompressed
+        attestation_document: String,  // base64, COSE Sign1 (or mock)
+    },
+
+    #[serde(rename = "sign-batch")]
+    SignBatch {
+        batch_digest: String, // hex bytes32
+        signature: String,   // hex, 65 bytes (r+s+v)
+    },
+
+    #[serde(rename = "health")]
+    Health {
+        initialized: bool,
+        public_key: Option<String>,
+    },
+
+    #[serde(rename = "error")]
+    Error { message: String },
 }
+
+// --- Enclave state ---
+
+struct EnclaveState {
+    signing_key: SigningKey,
+    public_key_bytes: Vec<u8>, // 65 bytes uncompressed
+}
+
+// --- Frame I/O (4-byte BE length prefix + payload) ---
 
 fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
@@ -48,51 +93,26 @@ fn write_frame(stream: &mut UnixStream, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn compute_user_data(input_bytes: &[u8], output_bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(input_bytes);
-    hasher.update(output_bytes);
-    let result = hasher.finalize();
-    let mut user_data = [0u8; 32];
-    user_data.copy_from_slice(&result);
-    user_data
-}
+// --- NSM attestation ---
 
-fn request_attestation(user_data: &[u8; 32]) -> Vec<u8> {
-    // Attempt to get real attestation from NSM
-    match get_nsm_attestation(user_data) {
-        Ok(doc) => doc,
-        Err(e) => {
-            eprintln!("[enclave] NSM attestation failed: {}, using mock", e);
-            create_mock_attestation(user_data)
-        }
-    }
-}
-
-fn get_nsm_attestation(user_data: &[u8; 32]) -> Result<Vec<u8>, String> {
+fn get_nsm_attestation(user_data: Option<&[u8]>, public_key: Option<&[u8]>) -> Result<Vec<u8>, String> {
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
     use aws_nitro_enclaves_nsm_api::driver;
 
-    // Open NSM device
     let nsm_fd = driver::nsm_init();
     if nsm_fd < 0 {
         return Err("Failed to open NSM device".to_string());
     }
 
-    // Create attestation request with user_data
     let request = Request::Attestation {
-        user_data: Some(user_data.to_vec().into()),
+        user_data: user_data.map(|d| d.to_vec().into()),
         nonce: None,
-        public_key: None,
+        public_key: public_key.map(|k| k.to_vec().into()),
     };
 
-    // Process the request
     let response = driver::nsm_process_request(nsm_fd, request);
-
-    // Close the device
     driver::nsm_exit(nsm_fd);
 
-    // Extract attestation document from response
     match response {
         Response::Attestation { document } => Ok(document),
         Response::Error(err) => Err(format!("NSM error: {:?}", err)),
@@ -100,11 +120,7 @@ fn get_nsm_attestation(user_data: &[u8; 32]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn create_mock_attestation(user_data: &[u8; 32]) -> Vec<u8> {
-    // Create a mock attestation document structure for testing outside enclave
-    // Real attestation documents are COSE Sign1 structures
-    // This mock is just for development/testing when NSM is not available
-
+fn create_mock_attestation(user_data: Option<&[u8]>, public_key: Option<&[u8]>) -> Vec<u8> {
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -115,13 +131,12 @@ fn create_mock_attestation(user_data: &[u8; 32]) -> Vec<u8> {
         pcrs: std::collections::HashMap<u32, String>,
         certificate: String,
         cabundle: Vec<String>,
-        user_data: String,
+        user_data: Option<String>,
         nonce: Option<String>,
         public_key: Option<String>,
     }
 
     let mut pcrs = std::collections::HashMap::new();
-    // Mock PCR values (48 bytes each, hex encoded)
     let mock_pcr = "0".repeat(96);
     for i in 0..16 {
         pcrs.insert(i, mock_pcr.clone());
@@ -134,85 +149,216 @@ fn create_mock_attestation(user_data: &[u8; 32]) -> Vec<u8> {
         pcrs,
         certificate: "MOCK_CERTIFICATE".to_string(),
         cabundle: vec!["MOCK_CA".to_string()],
-        user_data: hex::encode(user_data),
+        user_data: user_data.map(hex::encode),
         nonce: None,
-        public_key: None,
+        public_key: public_key.map(hex::encode),
     };
 
-    // Note: In a real attestation, this would be COSE Sign1 structure
-    // For mock purposes, we just return a simple CBOR encoding
-    // The verifier will detect this as mock and skip signature verification
-
-    // Simple mock: prefix with "MOCK" magic bytes so verifier knows it's fake
     let mut result = b"MOCK".to_vec();
     result.extend(serde_json::to_vec(&payload).unwrap_or_default());
     result
 }
 
-// Simple hex encoding for mock attestation
-mod hex {
-    pub fn encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{:02x}", b)).collect()
+fn request_attestation(user_data: Option<&[u8]>, public_key: Option<&[u8]>) -> Vec<u8> {
+    match get_nsm_attestation(user_data, public_key) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("[enclave] NSM attestation failed: {}, using mock", e);
+            create_mock_attestation(user_data, public_key)
+        }
     }
 }
 
-fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
+// --- Batch signing ---
+
+fn sign_batch(
+    signing_key: &SigningKey,
+    start_output_root: B256,
+    end_output_root: B256,
+    l2_block_number: U256,
+    chain_id: U256,
+) -> (B256, Vec<u8>) {
+    // Compute batchDigest = keccak256(abi.encode(startRoot, endRoot, l2Block, chainId))
+    let encoded = [
+        start_output_root.as_slice(),
+        end_output_root.as_slice(),
+        &l2_block_number.to_be_bytes::<32>(),
+        &chain_id.to_be_bytes::<32>(),
+    ]
+    .concat();
+    let batch_digest = keccak256(&encoded);
+
+    // Sign with secp256k1 (sign_prehash_recoverable)
+    let (sig, recovery_id) = signing_key
+        .sign_prehash_recoverable(batch_digest.as_slice())
+        .expect("signing failed");
+
+    // Pack as 65 bytes: r(32) + s(32) + v(1)
+    let mut signature = sig.to_bytes().to_vec(); // 64 bytes (r + s)
+    signature.push(recovery_id.to_byte() + 27); // v: 0/1 -> 27/28
+
+    (batch_digest, signature)
+}
+
+fn parse_hex_bytes32(s: &str) -> Result<B256, String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", bytes.len()));
+    }
+    Ok(B256::from_slice(&bytes))
+}
+
+// --- Command handling ---
+
+fn handle_command(command: Command, state: &mut Option<EnclaveState>) -> Response {
+    match command {
+        Command::Init => {
+            eprintln!("[enclave] Handling init command");
+
+            // Generate secp256k1 keypair
+            let signing_key = SigningKey::random(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let public_key_bytes = verifying_key
+                .to_encoded_point(false) // uncompressed: 0x04 + x(32) + y(32) = 65 bytes
+                .as_bytes()
+                .to_vec();
+
+            eprintln!(
+                "[enclave] Generated secp256k1 keypair, pubkey: {} bytes",
+                public_key_bytes.len()
+            );
+
+            // Request attestation with public key embedded
+            let attestation_doc = request_attestation(None, Some(&public_key_bytes));
+            eprintln!(
+                "[enclave] Got attestation document: {} bytes",
+                attestation_doc.len()
+            );
+
+            let public_key_hex = hex::encode(&public_key_bytes);
+            let attestation_b64 =
+                base64::engine::general_purpose::STANDARD.encode(&attestation_doc);
+
+            // Store state
+            *state = Some(EnclaveState {
+                signing_key,
+                public_key_bytes,
+            });
+
+            Response::Init {
+                public_key: public_key_hex,
+                attestation_document: attestation_b64,
+            }
+        }
+
+        Command::SignBatch {
+            start_output_root,
+            end_output_root,
+            l2_block_number,
+            chain_id,
+        } => {
+            eprintln!("[enclave] Handling sign-batch command");
+
+            let st = match state.as_ref() {
+                Some(s) => s,
+                None => {
+                    return Response::Error {
+                        message: "Not initialized. Call 'init' first.".to_string(),
+                    };
+                }
+            };
+
+            let start_root = match parse_hex_bytes32(&start_output_root) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Invalid start_output_root: {}", e),
+                    };
+                }
+            };
+            let end_root = match parse_hex_bytes32(&end_output_root) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Invalid end_output_root: {}", e),
+                    };
+                }
+            };
+
+            let l2_block = U256::from(l2_block_number);
+            let chain = U256::from(chain_id);
+
+            let (batch_digest, signature) =
+                sign_batch(&st.signing_key, start_root, end_root, l2_block, chain);
+
+            eprintln!(
+                "[enclave] Signed batch digest: 0x{}",
+                hex::encode(batch_digest.as_slice())
+            );
+
+            Response::SignBatch {
+                batch_digest: format!("0x{}", hex::encode(batch_digest.as_slice())),
+                signature: format!("0x{}", hex::encode(&signature)),
+            }
+        }
+
+        Command::Health => {
+            let (initialized, public_key) = match state.as_ref() {
+                Some(st) => (true, Some(hex::encode(&st.public_key_bytes))),
+                None => (false, None),
+            };
+
+            Response::Health {
+                initialized,
+                public_key,
+            }
+        }
+    }
+}
+
+fn handle_client(mut stream: UnixStream, state: &mut Option<EnclaveState>) -> std::io::Result<()> {
     eprintln!("[enclave] Client connected");
 
-    // Read input frame
-    let input_bytes = read_frame(&mut stream)?;
+    // Read command frame
+    let cmd_bytes = read_frame(&mut stream)?;
     eprintln!(
-        "[enclave] Received {} bytes of input",
-        input_bytes.len()
+        "[enclave] Received {} bytes of command",
+        cmd_bytes.len()
     );
 
-    // Parse input JSON
-    let input: Input = serde_json::from_slice(&input_bytes).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e))
-    })?;
-    eprintln!("[enclave] Parsed input: {:?}", input);
-
-    // Perform mock computation (sum the values)
-    let result: i64 = input.values.iter().sum();
-    let output = Output {
-        result,
-        processed: true,
+    // Parse command
+    let command: Command = match serde_json::from_slice(&cmd_bytes) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            let response = Response::Error {
+                message: format!("Invalid command JSON: {}", e),
+            };
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            write_frame(&mut stream, &response_bytes)?;
+            return Ok(());
+        }
     };
-    eprintln!("[enclave] Computed output: {:?}", output);
+    eprintln!("[enclave] Parsed command: {:?}", command);
 
-    // Serialize output
-    let output_bytes = serde_json::to_vec(&output).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialization failed: {}", e))
+    // Handle command
+    let response = handle_command(command, state);
+
+    // Send response frame
+    let response_bytes = serde_json::to_vec(&response).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("JSON serialization failed: {}", e),
+        )
     })?;
+    write_frame(&mut stream, &response_bytes)?;
+    eprintln!("[enclave] Sent response frame ({} bytes)", response_bytes.len());
 
-    // Compute user_data = SHA-256(input || output)
-    let user_data = compute_user_data(&input_bytes, &output_bytes);
-    eprintln!(
-        "[enclave] Computed user_data (SHA-256): {}",
-        hex::encode(&user_data)
-    );
-
-    // Request attestation document with user_data
-    let attestation_doc = request_attestation(&user_data);
-    eprintln!(
-        "[enclave] Got attestation document: {} bytes",
-        attestation_doc.len()
-    );
-
-    // Send output frame (first frame)
-    write_frame(&mut stream, &output_bytes)?;
-    eprintln!("[enclave] Sent output frame");
-
-    // Send attestation document frame (second frame)
-    write_frame(&mut stream, &attestation_doc)?;
-    eprintln!("[enclave] Sent attestation document frame");
-
-    eprintln!("[enclave] Request completed successfully");
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[enclave] Starting enclave application");
+    eprintln!("[enclave] Starting enclave application (daemon mode)");
     eprintln!("[enclave] Listening on vsock port {}", VSOCK_PORT);
 
     // Create vsock socket
@@ -231,25 +377,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     listen(&sock_fd, Backlog::new(10)?)?;
     eprintln!("[enclave] Socket bound and listening");
 
-    // One-Shot mode: accept a single connection, handle it, then exit
-    eprintln!("[enclave] Waiting for connection (one-shot mode)...");
-    match accept(sock_fd.as_raw_fd()) {
-        Ok(client_fd) => {
-            // Safety: we just got this fd from accept
-            let owned_fd = unsafe { OwnedFd::from_raw_fd(client_fd) };
-            let stream = UnixStream::from(owned_fd);
+    // Persistent state across connections
+    let mut state: Option<EnclaveState> = None;
 
-            if let Err(e) = handle_client(stream) {
-                eprintln!("[enclave] Error handling client: {}", e);
-                std::process::exit(1);
+    // Daemon mode: accept connections in a loop
+    loop {
+        eprintln!("[enclave] Waiting for connection...");
+        match accept(sock_fd.as_raw_fd()) {
+            Ok(client_fd) => {
+                let owned_fd = unsafe { OwnedFd::from_raw_fd(client_fd) };
+                let stream = UnixStream::from(owned_fd);
+
+                if let Err(e) = handle_client(stream, &mut state) {
+                    eprintln!("[enclave] Error handling client: {}", e);
+                    // Don't exit - continue serving
+                }
+            }
+            Err(e) => {
+                eprintln!("[enclave] Accept error: {}", e);
+                // Don't exit on transient accept errors
             }
         }
-        Err(e) => {
-            eprintln!("[enclave] Accept error: {}", e);
-            std::process::exit(1);
-        }
     }
-
-    eprintln!("[enclave] One-shot request completed, exiting");
-    Ok(())
 }

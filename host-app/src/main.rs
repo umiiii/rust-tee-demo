@@ -1,7 +1,5 @@
-use base64::Engine;
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
 use serde::{Deserialize, Serialize};
-// sha2 not needed on host side; hash is computed inside the enclave
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -39,10 +37,36 @@ struct DockerImageInfo {
 
 #[derive(Debug, Serialize)]
 struct ProofPackage {
-    attestation_document: String, // Base64-encoded CBOR
-    output: serde_json::Value,
-    output_raw: String,           // Base64-encoded raw output bytes (for exact hash reproduction)
+    attestation_document: String, // Base64-encoded COSE Sign1 (or mock)
+    public_key: String,           // Hex-encoded secp256k1 uncompressed (65 bytes)
     docker_image_info: DockerImageInfo,
+}
+
+// Enclave response types
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum EnclaveResponse {
+    #[serde(rename = "init")]
+    Init {
+        public_key: String,
+        attestation_document: String,
+    },
+
+    #[serde(rename = "sign-batch")]
+    SignBatch {
+        batch_digest: String,
+        signature: String,
+    },
+
+    #[serde(rename = "health")]
+    #[allow(dead_code)]
+    Health {
+        initialized: bool,
+        public_key: Option<String>,
+    },
+
+    #[serde(rename = "error")]
+    Error { message: String },
 }
 
 fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
@@ -172,7 +196,6 @@ fn load_docker_image_info(info_path: &str) -> DockerImageInfo {
         }
     }
 
-    // Return placeholder if file doesn't exist
     eprintln!("[host] Warning: docker_image_info.json not found, using placeholders");
     DockerImageInfo {
         dockerfile_content: "<not available - run build.sh to generate>".to_string(),
@@ -193,125 +216,170 @@ fn get_git_commit() -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+fn send_command(stream: &mut UnixStream, command_json: &str) -> Result<EnclaveResponse, Box<dyn std::error::Error>> {
+    write_frame(stream, command_json.as_bytes())?;
+
+    let response_bytes = read_frame(stream)?;
+    let response: EnclaveResponse = serde_json::from_slice(&response_bytes)?;
+    Ok(response)
+}
+
 fn print_usage() {
-    eprintln!("Usage: host-app <eif-path> <input-file> <output-dir>");
+    eprintln!("Usage: host-app <command> [options]");
     eprintln!();
-    eprintln!("Arguments:");
-    eprintln!("  eif-path    Path to the enclave EIF file");
-    eprintln!("  input-file  Path to the JSON input file");
-    eprintln!("  output-dir  Directory to write proof package output");
+    eprintln!("Commands:");
+    eprintln!("  init <eif-path> <output-dir>     Initialize enclave and generate proof package");
+    eprintln!("  sign-batch <eif-path> <params>    Sign a batch digest (requires running enclave)");
     eprintln!();
-    eprintln!("Example:");
-    eprintln!("  host-app enclave.eif test_input.json ./output");
+    eprintln!("Examples:");
+    eprintln!("  host-app init enclave.eif ./output");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() != 4 {
+    if args.len() < 2 {
         print_usage();
         std::process::exit(1);
     }
 
-    let eif_path = &args[1];
-    let input_file = &args[2];
-    let output_dir = &args[3];
+    match args[1].as_str() {
+        "init" => {
+            if args.len() != 4 {
+                eprintln!("Usage: host-app init <eif-path> <output-dir>");
+                std::process::exit(1);
+            }
 
-    // Validate paths
-    if !Path::new(eif_path).exists() {
-        return Err(format!("EIF file not found: {}", eif_path).into());
-    }
-    if !Path::new(input_file).exists() {
-        return Err(format!("Input file not found: {}", input_file).into());
-    }
+            let eif_path = &args[2];
+            let output_dir = &args[3];
 
-    // Create output directory
-    fs::create_dir_all(output_dir)?;
+            if !Path::new(eif_path).exists() {
+                return Err(format!("EIF file not found: {}", eif_path).into());
+            }
 
-    // Read input
-    let input_bytes = fs::read(input_file)?;
-    eprintln!("[host] Read {} bytes from input file", input_bytes.len());
+            fs::create_dir_all(output_dir)?;
 
-    // Validate input is valid JSON
-    let _: serde_json::Value = serde_json::from_slice(&input_bytes)?;
+            // Run enclave
+            let enclave_info = run_enclave(eif_path)?;
 
-    // Run enclave
-    let enclave_info = run_enclave(eif_path)?;
+            // Give enclave time to start up
+            thread::sleep(Duration::from_secs(2));
 
-    // Give enclave time to start up
-    thread::sleep(Duration::from_secs(2));
+            // Connect to enclave
+            let mut stream = match connect_to_enclave(enclave_info.enclave_cid, 10) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = terminate_enclave(&enclave_info.enclave_id);
+                    return Err(e);
+                }
+            };
 
-    // Connect to enclave
-    let mut stream = match connect_to_enclave(enclave_info.enclave_cid, 10) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = terminate_enclave(&enclave_info.enclave_id);
-            return Err(e);
+            // Send init command
+            eprintln!("[host] Sending init command to enclave");
+            let response = match send_command(&mut stream, r#"{"command":"init"}"#) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = terminate_enclave(&enclave_info.enclave_id);
+                    return Err(format!("Failed to communicate with enclave: {}", e).into());
+                }
+            };
+
+            // Terminate enclave
+            terminate_enclave(&enclave_info.enclave_id)?;
+
+            // Process response
+            match response {
+                EnclaveResponse::Init {
+                    public_key,
+                    attestation_document,
+                } => {
+                    eprintln!("[host] Init successful!");
+                    eprintln!("[host] Public key: {}", &public_key[..16]);
+                    eprintln!(
+                        "[host] Attestation document: {} chars (base64)",
+                        attestation_document.len()
+                    );
+
+                    // Load docker image info
+                    let docker_image_info = load_docker_image_info("docker_image_info.json");
+
+                    // Assemble proof package
+                    let proof_package = ProofPackage {
+                        attestation_document,
+                        public_key,
+                        docker_image_info,
+                    };
+
+                    // Write proof package
+                    let proof_path = Path::new(output_dir).join("proof_package.json");
+                    let proof_json = serde_json::to_string_pretty(&proof_package)?;
+                    fs::write(&proof_path, &proof_json)?;
+                    eprintln!("[host] Proof package written to: {}", proof_path.display());
+                }
+                EnclaveResponse::Error { message } => {
+                    return Err(format!("Enclave error: {}", message).into());
+                }
+                other => {
+                    return Err(format!("Unexpected response: {:?}", other).into());
+                }
+            }
+
+            eprintln!("[host] Done!");
         }
-    };
 
-    // Send input
-    eprintln!("[host] Sending input to enclave");
-    if let Err(e) = write_frame(&mut stream, &input_bytes) {
-        let _ = terminate_enclave(&enclave_info.enclave_id);
-        return Err(format!("Failed to send input: {}", e).into());
+        "sign-batch" => {
+            // For sign-batch, we expect a running enclave (daemon mode)
+            // Usage: host-app sign-batch <cid> <start_root> <end_root> <l2_block> <chain_id>
+            if args.len() != 7 {
+                eprintln!("Usage: host-app sign-batch <cid> <start_output_root> <end_output_root> <l2_block_number> <chain_id>");
+                std::process::exit(1);
+            }
+
+            let cid: u32 = args[2].parse()?;
+            let start_root = &args[3];
+            let end_root = &args[4];
+            let l2_block: u64 = args[5].parse()?;
+            let chain_id: u64 = args[6].parse()?;
+
+            let mut stream = connect_to_enclave(cid, 5)?;
+
+            let cmd = serde_json::json!({
+                "command": "sign-batch",
+                "start_output_root": start_root,
+                "end_output_root": end_root,
+                "l2_block_number": l2_block,
+                "chain_id": chain_id
+            });
+
+            eprintln!("[host] Sending sign-batch command");
+            let response = send_command(&mut stream, &cmd.to_string())?;
+
+            match response {
+                EnclaveResponse::SignBatch {
+                    batch_digest,
+                    signature,
+                } => {
+                    // Output as JSON to stdout for scripting
+                    let output = serde_json::json!({
+                        "batch_digest": batch_digest,
+                        "signature": signature
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                EnclaveResponse::Error { message } => {
+                    return Err(format!("Enclave error: {}", message).into());
+                }
+                other => {
+                    return Err(format!("Unexpected response: {:?}", other).into());
+                }
+            }
+        }
+
+        _ => {
+            print_usage();
+            std::process::exit(1);
+        }
     }
 
-    // Receive output frame
-    eprintln!("[host] Waiting for output from enclave");
-    let output_bytes = match read_frame(&mut stream) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = terminate_enclave(&enclave_info.enclave_id);
-            return Err(format!("Failed to receive output: {}", e).into());
-        }
-    };
-    eprintln!("[host] Received {} bytes of output", output_bytes.len());
-
-    // Receive attestation document frame
-    eprintln!("[host] Waiting for attestation document from enclave");
-    let attestation_bytes = match read_frame(&mut stream) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = terminate_enclave(&enclave_info.enclave_id);
-            return Err(format!("Failed to receive attestation: {}", e).into());
-        }
-    };
-    eprintln!(
-        "[host] Received {} bytes of attestation document",
-        attestation_bytes.len()
-    );
-
-    // Terminate enclave
-    terminate_enclave(&enclave_info.enclave_id)?;
-
-    // Parse output JSON
-    let output: serde_json::Value = serde_json::from_slice(&output_bytes)?;
-    eprintln!("[host] Output: {}", serde_json::to_string_pretty(&output)?);
-
-    // Load docker image info
-    let docker_image_info = load_docker_image_info("docker_image_info.json");
-
-    // Assemble proof package
-    // output_raw preserves the exact bytes for hash verification (avoids re-serialization mismatch)
-    let proof_package = ProofPackage {
-        attestation_document: base64::engine::general_purpose::STANDARD.encode(&attestation_bytes),
-        output,
-        output_raw: base64::engine::general_purpose::STANDARD.encode(&output_bytes),
-        docker_image_info,
-    };
-
-    // Write proof package
-    let proof_path = Path::new(output_dir).join("proof_package.json");
-    let proof_json = serde_json::to_string_pretty(&proof_package)?;
-    fs::write(&proof_path, &proof_json)?;
-    eprintln!("[host] Proof package written to: {}", proof_path.display());
-
-    // Also copy input for verification
-    let input_copy_path = Path::new(output_dir).join("input.json");
-    fs::copy(input_file, &input_copy_path)?;
-    eprintln!("[host] Input copied to: {}", input_copy_path.display());
-
-    eprintln!("[host] Done!");
     Ok(())
 }
