@@ -76,13 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[host] WS connected, sending {} frames of {} bytes each", count, frame_size);
 
         let payload = Bytes::from(vec![0xABu8; frame_size]);
+        let mut last = std::time::Instant::now();
         for i in 1..=count {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            eprintln!("[host] WS send frame {} at {}ms ({} bytes)", i, now, frame_size);
             ws.send(Message::Binary(payload.clone().into())).await?;
+            let elapsed = last.elapsed();
+            last = std::time::Instant::now();
+            eprintln!("[host] WS sent frame {} ({} bytes) interval={:.3}ms", i, frame_size, elapsed.as_secs_f64() * 1000.0);
         }
 
         ws.close(None).await?;
