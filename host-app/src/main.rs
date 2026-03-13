@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  cmd:   upload | gen_doc | websocket");
         eprintln!("  size:  required for upload — 100KB | 500MB | 1GB");
         eprintln!("  count: required for websocket — number of frames to send");
+        eprintln!("  size:  required for websocket — frame size e.g. 1KB, 1MB");
         std::process::exit(1);
     }
 
@@ -45,13 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cmd = args[2].as_str();
 
-    if cmd == "websocket" {
+    if cmd == "stream" {
         use tokio_tungstenite::tungstenite::Message;
         use futures::SinkExt;
 
         let count: usize = args.get(3)
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
+        let frame_size: usize = args.get(4)
+            .map(|s| parse_size(s))
+            .transpose()?
+            .unwrap_or(1024); // default 1KB
 
         #[cfg(feature = "vsock")]
         let stream = {
@@ -68,16 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let url = format!("ws://enclave:{}", ENCLAVE_WS_PORT);
         let (mut ws, _) = tokio_tungstenite::client_async(url, stream).await?;
-        eprintln!("[host] WS connected");
+        eprintln!("[host] WS connected, sending {} frames of {} bytes each", count, frame_size);
 
+        let payload = Bytes::from(vec![0xABu8; frame_size]);
         for i in 1..=count {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let text = format!("send dataframe {} at {}ms", i, now);
-            eprintln!("[host] WS send: {}", text);
-            ws.send(Message::Text(text.into())).await?;
+            eprintln!("[host] WS send frame {} at {}ms ({} bytes)", i, now, frame_size);
+            ws.send(Message::Binary(payload.clone().into())).await?;
         }
 
         ws.close(None).await?;

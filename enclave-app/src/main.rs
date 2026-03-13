@@ -171,10 +171,10 @@ async fn handle_ws_connection(stream: VsockStream) {
     while let Some(msg) = ws.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                eprintln!("[enclave] WS recv {} bytes: {}", data.len(), hex::encode(&data));
+                eprintln!("[enclave] WS recv {} bytes", data.len());
             }
             Ok(Message::Text(text)) => {
-                eprintln!("[enclave] WS recv text: {}", text);
+                eprintln!("[enclave] WS recv text ({} bytes)", text.len());
             }
             Ok(Message::Close(_)) => {
                 eprintln!("[enclave] WS connection closed");
