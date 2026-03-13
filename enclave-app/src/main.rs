@@ -98,7 +98,32 @@ async fn handle_attestation() -> impl IntoResponse {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
 
     let secret_key = k256::SecretKey::random(&mut rand::rngs::OsRng);
+
+    // Serialize to bytes and print as hex
+    let secret_key_bytes = secret_key.to_bytes();
+    let secret_key_hex = hex::encode(&secret_key_bytes);
+    eprintln!("[enclave] secret_key (hex): {}", secret_key_hex);
+
+    // Recover from hex string
+    let recovered_bytes = hex::decode(&secret_key_hex).expect("hex decode failed");
+    let recovered_key = k256::SecretKey::from_bytes(recovered_bytes.as_slice().into())
+        .expect("secret key recovery failed");
+    assert_eq!(secret_key.to_bytes(), recovered_key.to_bytes());
+
     let pub_key = secret_key.public_key().to_encoded_point(false); // uncompressed, 65 bytes
+    eprintln!("[enclave] pub_key (hex): {}", hex::encode(pub_key.as_bytes()));
+
+    // Sign and verify
+    use k256::ecdsa::{signature::{Signer, Verifier}, Signature, SigningKey, VerifyingKey};
+    let message = b"I am OKX";
+    let signing_key = SigningKey::from(&secret_key);
+    let signature: Signature = signing_key.sign(message);
+    eprintln!("[enclave] message (hex): {}", hex::encode(message));
+    eprintln!("[enclave] signature (hex): {}", hex::encode(signature.to_bytes()));
+
+    let verifying_key = VerifyingKey::from(&secret_key.public_key());
+    verifying_key.verify(message, &signature).expect("signature verification failed");
+    eprintln!("[enclave] signature verified ok");
 
     match generate_attestation_doc(b"Tradezone TEE Verifier", b"", pub_key.as_bytes()) {
         Ok(doc) => (StatusCode::OK, B64.encode(&doc)),
