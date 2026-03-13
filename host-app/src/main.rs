@@ -12,6 +12,7 @@ use tokio_vsock::{VsockAddr, VsockStream};
 use tokio::net::TcpStream;
 
 const ENCLAVE_PORT: u16 = 8000;
+const ENCLAVE_WS_PORT: u16 = 8001;
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB per chunk
 
 fn parse_size(s: &str) -> Result<usize, String> {
@@ -31,10 +32,11 @@ fn parse_size(s: &str) -> Result<usize, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: host-app <cid> <cmd> [size]");
-        eprintln!("  cid:  enclave CID (vsock feature only; ignored otherwise)");
-        eprintln!("  cmd:  upload | gen_doc");
-        eprintln!("  size: required for upload — 100KB | 500MB | 1GB");
+        eprintln!("Usage: host-app <cid> <cmd> [size|count]");
+        eprintln!("  cid:   enclave CID (vsock feature only; ignored otherwise)");
+        eprintln!("  cmd:   upload | gen_doc | websocket");
+        eprintln!("  size:  required for upload — 100KB | 500MB | 1GB");
+        eprintln!("  count: required for websocket — number of frames to send");
         std::process::exit(1);
     }
 
@@ -42,6 +44,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cid: u32 = args[1].parse().map_err(|_| format!("invalid CID '{}'", args[1]))?;
 
     let cmd = args[2].as_str();
+
+    if cmd == "websocket" {
+        use tokio_tungstenite::tungstenite::Message;
+        use futures::SinkExt;
+
+        let count: usize = args.get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        #[cfg(feature = "vsock")]
+        let stream = {
+            eprintln!("[host] Connecting WS via vsock CID {} port {}", cid, ENCLAVE_WS_PORT);
+            VsockStream::connect(VsockAddr::new(cid, ENCLAVE_WS_PORT as u32)).await?
+        };
+
+        #[cfg(not(feature = "vsock"))]
+        let stream = {
+            let addr = format!("127.0.0.1:{}", ENCLAVE_WS_PORT);
+            eprintln!("[host] Connecting WS via TCP {}", addr);
+            TcpStream::connect(&addr).await?
+        };
+
+        let url = format!("ws://enclave:{}", ENCLAVE_WS_PORT);
+        let (mut ws, _) = tokio_tungstenite::client_async(url, stream).await?;
+        eprintln!("[host] WS connected");
+
+        for i in 1..=count {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let text = format!("send dataframe {} at {}ms", i, now);
+            eprintln!("[host] WS send: {}", text);
+            ws.send(Message::Text(text.into())).await?;
+        }
+
+        ws.close(None).await?;
+        eprintln!("[host] WS done");
+        return Ok(());
+    }
 
     #[cfg(feature = "vsock")]
     let io = {

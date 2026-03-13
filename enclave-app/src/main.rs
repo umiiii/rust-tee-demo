@@ -155,6 +155,43 @@ async fn handle_upload(req: Request) -> impl IntoResponse {
     serde_json::json!({ "hash": hash_hex, "size": size }).to_string()
 }
 
+#[cfg(feature = "vsock")]
+async fn handle_ws_connection(stream: VsockStream) {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("[enclave] WS handshake error: {}", e);
+            return;
+        }
+    };
+
+    let mut delay_secs = 1u64;
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Binary(data)) => {
+                eprintln!("[enclave] WS recv {} bytes: {}", data.len(), hex::encode(&data));
+            }
+            Ok(Message::Text(text)) => {
+                eprintln!("[enclave] WS recv text: {}", text);
+            }
+            Ok(Message::Close(_)) => {
+                eprintln!("[enclave] WS connection closed");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[enclave] WS error: {}", e);
+                break;
+            }
+        }
+        eprintln!("[enclave] WS waiting {}s before next recv", delay_secs);
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+        delay_secs += 1;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
@@ -163,6 +200,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "vsock")]
     {
+        const WS_PORT: u32 = 8001;
+        let mut ws_vsock = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, WS_PORT))?;
+        tokio::spawn(async move {
+            eprintln!("[enclave] WS listening on vsock port {}", WS_PORT);
+            loop {
+                match ws_vsock.accept().await {
+                    Ok((stream, addr)) => {
+                        eprintln!("[enclave] WS connection from {:?}", addr);
+                        tokio::spawn(handle_ws_connection(stream));
+                    }
+                    Err(e) => eprintln!("[enclave] WS accept error: {}", e),
+                }
+            }
+        });
+
         eprintln!("[enclave] Listening on vsock port {}", PORT);
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, PORT as u32))?;
         axum::serve(VsockListenerAdapter::new(listener), app).await?;
